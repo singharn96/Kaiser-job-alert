@@ -2,9 +2,9 @@ name: Kaiser NorCal RN Job Check
 
 on:
   schedule:
-    # Every 8 hours. GitHub cron is in UTC.
-    # 05:00, 13:00, 21:00 UTC = 6 AM, 2 PM, 10 PM Pacific (PDT).
-    - cron: "0 5,13,21 * * *"
+        # Every 30 minutes, around the clock.
+        # (GitHub may delay scheduled runs a few minutes under load.)
+        - cron: "*/30 * * * *"
   workflow_dispatch: {}   # lets you run it manually from the Actions tab
 
 # Allow the workflow to commit the updated seen_jobs.json back to the repo.
