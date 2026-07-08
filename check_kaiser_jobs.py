@@ -216,7 +216,7 @@ def save_seen(seen: dict) -> None:
 # Telegram
 # --------------------------------------------------------------------------- #
 
-def send_telegram(text: str) -> None:
+def send_telegram(text: str, preview: bool = False) -> None:
     if not BOT_TOKEN or not CHAT_ID:
         print("[error] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set.")
         return
@@ -227,7 +227,7 @@ def send_telegram(text: str) -> None:
             "chat_id": CHAT_ID,
             "text": text,
             "parse_mode": "HTML",
-            "disable_web_page_preview": "true",
+            "disable_web_page_preview": "false" if preview else "true",
         },
         timeout=30,
     )
@@ -237,26 +237,44 @@ def send_telegram(text: str) -> None:
         print("[info] Telegram message sent.")
 
 
+def _short_date(pubdate: str) -> str:
+    """Turn 'Tue, 09 Jun 2026 00:10:24 GMT' into 'Jun 09, 2026'."""
+    try:
+        from email.utils import parsedate_to_datetime
+        return parsedate_to_datetime(pubdate).strftime("%b %d, %Y")
+    except Exception:
+        return pubdate
+
+
+def _job_block(j: dict) -> str:
+    lines = [f"<b>{html.escape(j['title'])}</b>"]
+    if j.get("location"):
+        lines.append(f"📍 {html.escape(j['location'])}")
+    if j.get("posted"):
+        lines.append(f"🗓 Posted {html.escape(_short_date(j['posted']))}")
+    # The raw link on its own line — visible and tappable.
+    lines.append(f"🔗 {html.escape(j['url'])}")
+    return "\n".join(lines)
+
+
 def notify_new_jobs(new_jobs: list[dict]) -> None:
     header = (
         f"🏥 <b>{len(new_jobs)} new Kaiser NorCal posting"
         f"{'s' if len(new_jobs) != 1 else ''}</b>\n\n"
     )
-    blocks = []
-    for j in new_jobs:
-        loc = f" — {html.escape(j['location'])}" if j["location"] else ""
-        blocks.append(
-            f"• <a href=\"{html.escape(j['url'])}\">"
-            f"{html.escape(j['title'])}</a>{loc}"
-        )
+    # Show a link preview only when there's a single new job (Telegram previews
+    # just the first link, so it's noise when there are several).
+    preview = len(new_jobs) == 1
     msg = header
-    for block in blocks:
+    for j in new_jobs:
+        block = _job_block(j)
         if len(msg) + len(block) + 2 > 3800:
-            send_telegram(msg)
+            send_telegram(msg, preview=preview)
             msg = ""
+            preview = False  # only the first chunk shows a preview
         msg += block + "\n\n"
     if msg.strip():
-        send_telegram(msg)
+        send_telegram(msg, preview=preview)
 
 
 # --------------------------------------------------------------------------- #
