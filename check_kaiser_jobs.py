@@ -1,52 +1,50 @@
 #!/usr/bin/env python3
 """
-Kaiser Permanente NorCal RN Job Alert
--------------------------------------
-Checks Kaiser's careers site for Registered Nurse postings in Northern
-California, compares them against a locally-stored history, and sends a
-Telegram message for any NEW posting.
+Kaiser Permanente NorCal Nursing Job Alert
+------------------------------------------
+Reads Kaiser's public jobs RSS feed, keeps postings in Northern California
+whose title matches your keywords (Staff Nurse, Emergency, Short Hour / SH),
+compares them against a stored history, and sends a Telegram message for any
+NEW posting.
 
 Runs unattended on GitHub Actions (see .github/workflows/job-check.yml).
 Everything it uses is free: GitHub Actions + Telegram Bot API.
+
+Why the RSS feed? Kaiser's careers site (Radancy) renders its search results
+in the browser via a session-based call that a plain script can't replay. The
+RSS feed at /rss is a stable, public endpoint listing every posting with its
+title, location, link and post date — exactly what a job alert needs.
 
 Environment variables required (set as GitHub repo secrets):
     TELEGRAM_BOT_TOKEN   token from @BotFather
     TELEGRAM_CHAT_ID     your numeric id from @userinfobot
 
 Optional environment variables:
-    KEYWORDS             comma-separated search terms
-                         (default: "registered nurse,RN")
-    MAX_PAGES            how many result pages to walk per term (default 5)
+    KEYWORDS   comma-separated title terms to match
+               (default: "staff nurse,emergency,short hour,SH")
 """
 
-import json
+import html
 import os
 import re
 import sys
-import time
-import html
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from urllib.parse import quote
 
 import requests
-from bs4 import BeautifulSoup
 
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
 
-BASE = "https://www.kaiserpermanentejobs.org"
-RESULTS_ENDPOINT = BASE + "/search-jobs/results"
-
+FEED_URL = "https://www.kaiserpermanentejobs.org/rss"
 SEEN_FILE = Path(__file__).with_name("seen_jobs.json")
 
 KEYWORDS = [
-    k.strip()
-    for k in os.environ.get("KEYWORDS", "registered nurse,RN").split(",")
+    k.strip().lower()
+    for k in os.environ.get("KEYWORDS", "staff nurse,emergency,short hour,SH").split(",")
     if k.strip()
 ]
-MAX_PAGES = int(os.environ.get("MAX_PAGES", "5"))
-RECORDS_PER_PAGE = 50
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -57,17 +55,15 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0 Safari/537.36"
     ),
-    "X-Requested-With": "XMLHttpRequest",
-    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept": "application/rss+xml, application/xml, text/xml, */*",
 }
 
 # --------------------------------------------------------------------------- #
 # Northern California location filter
 # --------------------------------------------------------------------------- #
-# We match on the posting's location text. A city must appear AND the state
-# must read as California (Kaiser writes "California" or "CA"). We also keep
-# an explicit exclude list so Southern California / out-of-state look-alikes
-# (Richmond VA vs Richmond CA, Fontana in SoCal, etc.) don't slip through.
+# Each RSS title ends with "(City, State, Country)". We read that city/state,
+# keep it only if the state is California, the city is a NorCal city, and it's
+# not one of the Southern-California / out-of-state look-alikes.
 
 NORCAL_CITIES = {
     # Greater Sacramento
@@ -93,122 +89,115 @@ NORCAL_CITIES = {
     "fresno", "clovis", "madera", "merced", "turlock",
 }
 
-# Cities to reject outright (Southern CA + common out-of-state collisions).
 EXCLUDE_CITIES = {
     "fontana", "ontario", "riverside", "san bernardino", "los angeles",
     "irvine", "anaheim", "downey", "baldwin park", "harbor city",
     "woodland hills", "panorama city", "west los angeles", "san diego",
     "moreno valley", "murrieta", "santa clarita", "bakersfield",
-    "kern", "orange county", "long beach", "pasadena",
+    "long beach", "pasadena",
 }
 
-STATE_OK = re.compile(r"\b(california|,?\s*ca)\b", re.IGNORECASE)
+STATE_OK = re.compile(r"\bcalifornia\b", re.IGNORECASE)
+LOC_PAREN = re.compile(r"\(([^)]+)\)\s*$")
 
 
 # --------------------------------------------------------------------------- #
-# Fetching & parsing
+# Fetch & parse the feed
 # --------------------------------------------------------------------------- #
 
-def fetch_page(keyword: str, page: int) -> str:
-    """Return the raw HTML fragment of one results page for a keyword."""
-    params = {
-        "Keywords": keyword,
-        "CurrentPage": page,
-        "RecordsPerPage": RECORDS_PER_PAGE,
-        "SortCriteria": 1,      # 1 = date
-        "SortDirection": 1,     # 1 = newest first
-        "SearchType": 5,
-    }
-    resp = requests.get(
-        RESULTS_ENDPOINT, params=params, headers=HEADERS, timeout=30
-    )
+def fetch_feed() -> str:
+    resp = requests.get(FEED_URL, headers=HEADERS, timeout=60)
     resp.raise_for_status()
-    # Radancy returns JSON: {"results": "<html>", "totalHits": N, ...}
-    try:
-        data = resp.json()
-        return data.get("results", "") or ""
-    except ValueError:
-        # Fallback: some deployments return the HTML directly.
-        return resp.text
+    return resp.text
 
 
-def parse_jobs(fragment: str) -> list[dict]:
-    """Extract job dicts from a results HTML fragment."""
-    soup = BeautifulSoup(fragment, "html.parser")
+def parse_feed(xml_text: str) -> list[dict]:
+    """Return a list of {id, title, location, url, posted} from the RSS."""
+    root = ET.fromstring(xml_text)
     jobs = []
-    # Radancy renders each result as an <a> wrapping the title/location.
-    for a in soup.select("a[href]"):
-        href = a.get("href", "")
-        if "/job/" not in href:
-            continue
-        title_el = a.find(["h2", "h3"])
-        title = (title_el.get_text(strip=True) if title_el
-                 else a.get_text(" ", strip=True))
-        loc_el = a.select_one(".job-location, .location, [class*='location']")
-        location = loc_el.get_text(strip=True) if loc_el else ""
-        url = href if href.startswith("http") else BASE + href
-        job_id = href.rstrip("/").split("/")[-1]
-        if not title:
-            continue
+    for item in root.iter("item"):
+        def text(tag):
+            el = item.find(tag)
+            return (el.text or "").strip() if el is not None else ""
+
+        raw_title = html.unescape(text("title"))
+        link = text("link")
+        guid = text("guid") or link
+        posted = text("pubDate")
+
+        loc = ""
+        m = LOC_PAREN.search(raw_title)
+        if m:
+            loc = m.group(1).strip()
+        # Clean title = drop the trailing " - (Location)" for display.
+        title = LOC_PAREN.sub("", raw_title).rstrip(" -").strip()
+
         jobs.append(
             {
-                "id": job_id,
-                "title": html.unescape(title),
-                "location": html.unescape(location),
-                "url": url,
+                "id": guid.rstrip("/").split("/")[-1] or guid,
+                "title": title,
+                "location": loc,
+                "url": link,
+                "posted": posted,
             }
         )
     return jobs
 
 
-def is_rn(job: dict) -> bool:
-    """Keep only Registered Nurse roles (title contains RN / Registered Nurse)."""
-    t = job["title"].lower()
-    if "registered nurse" in t:
-        return True
-    # Match RN as a standalone token so "BuRN unit" etc. don't false-positive.
-    return re.search(r"\brn\b", t) is not None
+# --------------------------------------------------------------------------- #
+# Filters
+# --------------------------------------------------------------------------- #
+
+def title_matches(title: str) -> bool:
+    """True if the title contains any configured keyword.
+
+    Short alphabetic keywords (<= 3 chars, e.g. "SH") are matched as whole
+    words so they don't fire on substrings; longer keywords match anywhere.
+    """
+    low = title.lower()
+    for kw in KEYWORDS:
+        if len(kw) <= 3 and kw.isalpha():
+            if re.search(r"(?<![a-z])" + re.escape(kw) + r"(?![a-z])", low):
+                return True
+        elif kw in low:
+            return True
+    return False
 
 
-def is_norcal(job: dict) -> bool:
-    loc = job["location"].lower()
+def is_norcal(location: str) -> bool:
+    loc = location.lower()
     if not loc:
         return False
     if any(bad in loc for bad in EXCLUDE_CITIES):
         return False
-    if not STATE_OK.search(job["location"]):
+    if not STATE_OK.search(location):
         return False
-    return any(city in loc for city in NORCAL_CITIES)
+    city = loc.split(",")[0].strip()
+    # match on the leading city token, but also allow city mentioned anywhere
+    return city in NORCAL_CITIES or any(c in loc for c in NORCAL_CITIES)
 
 
 def collect_jobs() -> dict[str, dict]:
-    """Walk all keywords/pages and return {job_id: job} for NorCal RN roles."""
+    xml_text = fetch_feed()
+    all_jobs = parse_feed(xml_text)
+    print(f"[info] feed items: {len(all_jobs)}")
     found: dict[str, dict] = {}
-    for keyword in KEYWORDS:
-        for page in range(1, MAX_PAGES + 1):
-            try:
-                fragment = fetch_page(keyword, page)
-            except Exception as exc:  # network / HTTP errors
-                print(f"[warn] fetch failed ({keyword} p{page}): {exc}")
-                break
-            page_jobs = parse_jobs(fragment)
-            if not page_jobs:
-                # No more results for this keyword.
-                break
-            kept = 0
-            for job in page_jobs:
-                if is_rn(job) and is_norcal(job):
-                    found[job["id"]] = job
-                    kept += 1
-            print(f"[info] {keyword!r} page {page}: "
-                  f"{len(page_jobs)} parsed, {kept} NorCal RN kept")
-            time.sleep(1)  # be polite
+    for job in all_jobs:
+        if not is_norcal(job["location"]):
+            continue
+        if not title_matches(job["title"]):
+            continue
+        found[job["id"]] = job
+    print(f"[info] NorCal matches for {KEYWORDS}: {len(found)}")
     return found
 
 
 # --------------------------------------------------------------------------- #
 # History (seen_jobs.json)
 # --------------------------------------------------------------------------- #
+
+import json  # noqa: E402
+
 
 def load_seen() -> dict:
     if SEEN_FILE.exists():
@@ -238,7 +227,7 @@ def send_telegram(text: str) -> None:
             "chat_id": CHAT_ID,
             "text": text,
             "parse_mode": "HTML",
-            "disable_web_page_preview": "false",
+            "disable_web_page_preview": "true",
         },
         timeout=30,
     )
@@ -249,9 +238,10 @@ def send_telegram(text: str) -> None:
 
 
 def notify_new_jobs(new_jobs: list[dict]) -> None:
-    # Telegram caps messages at ~4096 chars; chunk into batches.
-    header = f"🏥 <b>{len(new_jobs)} new Kaiser NorCal RN posting" \
-             f"{'s' if len(new_jobs) != 1 else ''}</b>\n\n"
+    header = (
+        f"🏥 <b>{len(new_jobs)} new Kaiser NorCal posting"
+        f"{'s' if len(new_jobs) != 1 else ''}</b>\n\n"
+    )
     blocks = []
     for j in new_jobs:
         loc = f" — {html.escape(j['location'])}" if j["location"] else ""
@@ -274,27 +264,24 @@ def notify_new_jobs(new_jobs: list[dict]) -> None:
 # --------------------------------------------------------------------------- #
 
 def main() -> int:
-    print(f"[info] keywords={KEYWORDS} max_pages={MAX_PAGES}")
+    print(f"[info] keywords={KEYWORDS}")
     current = collect_jobs()
-    print(f"[info] total NorCal RN roles found: {len(current)}")
 
     seen = load_seen()
     first_run = len(seen) == 0
-
     new_ids = [jid for jid in current if jid not in seen]
 
-    # Merge current into history (keep old entries so re-listings don't re-alert).
     for jid, job in current.items():
         seen[jid] = job
     save_seen(seen)
 
     if first_run:
-        msg = (
-            "✅ <b>Kaiser NorCal RN alert is live.</b>\n\n"
-            f"Baseline captured: {len(current)} current RN postings.\n"
+        send_telegram(
+            "✅ <b>Kaiser NorCal alert is live.</b>\n\n"
+            f"Baseline captured: {len(current)} current postings matching "
+            f"{', '.join(KEYWORDS)}.\n"
             "From now on you'll only be pinged about <b>new</b> ones."
         )
-        send_telegram(msg)
         print("[info] first run — baseline saved, no per-job alerts.")
         return 0
 

@@ -1,8 +1,9 @@
-# Kaiser NorCal RN Job Alert
+# Kaiser NorCal Nursing Job Alert
 
-A free, hands-off alert that checks Kaiser Permanente's careers site for
-**Registered Nurse** postings in **Northern California** and sends you a
-**Telegram** message the moment a new one appears.
+A free, hands-off alert that reads Kaiser Permanente's public jobs feed for
+**Northern California** postings matching your keywords — **Staff Nurse**,
+**Emergency**, and **Short Hour / SH** — and sends you a **Telegram** message
+the moment a new one appears.
 
 - **Cost:** $0. GitHub Actions runs it on a schedule; Telegram delivers the alert.
 - **Schedule:** every **8 hours** — 6 AM, 2 PM, 10 PM Pacific.
@@ -13,10 +14,17 @@ A free, hands-off alert that checks Kaiser Permanente's careers site for
 ## How it works
 
 1. On a schedule, GitHub Actions runs `check_kaiser_jobs.py`.
-2. The script queries Kaiser's careers site for RN roles, newest first.
-3. It filters to RN titles in ~70 Northern California cities.
+2. The script reads Kaiser's public jobs RSS feed (every open posting, with
+   title, location and link).
+3. It keeps postings in ~70 Northern California cities whose title matches your
+   keywords (default: `staff nurse`, `emergency`, `short hour`, `SH`).
 4. It compares the results against `seen_jobs.json` (its memory of past postings).
 5. Anything new gets sent to your Telegram, each with a direct apply link.
+
+> **Why the RSS feed?** Kaiser's careers site renders search results in the
+> browser through a session-based call a plain script can't replay. The `/rss`
+> feed is the stable, public source that lists every posting — the right
+> foundation for an alert.
 
 The first run just captures a **baseline** and sends a confirmation — so you
 don't get blasted with every existing posting. After that, you only hear about
@@ -72,11 +80,14 @@ From then on it runs itself every 8 hours.
 
 ## Customizing
 
-Edit these in `.github/workflows/job-check.yml` under the **Run job check** step:
+Edit the `KEYWORDS` line in `.github/workflows/job-check.yml` under the
+**Run job check** step. It's a comma-separated list of title terms; a posting
+alerts if its title contains **any** of them (short all-letter terms like `SH`
+match as whole words).
 
-- **ED-only alerts** (matches your ED background): set
-  `KEYWORDS: "emergency,ED,emergency department"`.
-- **Search deeper:** raise `MAX_PAGES` (default 5).
+- **Default:** `KEYWORDS: "staff nurse,emergency,short hour,SH"`.
+- **ED-only:** `KEYWORDS: "emergency"`.
+- **Add specialties:** e.g. `KEYWORDS: "staff nurse,emergency,icu,telemetry"`.
 
 Change the schedule by editing the `cron` line at the top of the same file.
 The times are **UTC**. Current setting `0 5,13,21 * * *` = 6 AM / 2 PM / 10 PM
@@ -86,19 +97,20 @@ Pacific. (Note: GitHub may delay scheduled runs a few minutes under load.)
 
 ## If alerts stop coming
 
-Scrapers depend on the target site's structure staying put. Kaiser's careers
-platform (Radancy) has used the same search endpoint for years, but if they
-ever redesign it, the parser may need a small tweak.
+This reads Kaiser's public RSS feed, which is far more stable than scraping the
+web pages — but if Kaiser ever moves or reformats the feed, it may need a tweak.
 
 **How to tell:** open the **Actions** tab → click the latest run → open the
-**Run job check** step. The log prints how many jobs it parsed per page:
+**Run job check** step. The log prints:
 
 ```
-[info] 'registered nurse' page 1: 50 parsed, 12 NorCal RN kept
+[info] feed items: 2511
+[info] NorCal matches for ['staff nurse', 'emergency', 'short hour', 'sh']: 80
 ```
 
-If it consistently prints `0 parsed`, the site markup changed. That's the
-signal to update the `parse_jobs()` selectors in `check_kaiser_jobs.py`.
+If `feed items` is `0`, the feed URL changed. If `feed items` looks normal but
+`NorCal matches` is `0` for a long time, the title/location format changed —
+update the filters in `check_kaiser_jobs.py`.
 
 ---
 
