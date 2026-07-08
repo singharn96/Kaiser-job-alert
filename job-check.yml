@@ -1,0 +1,53 @@
+name: Kaiser NorCal RN Job Check
+
+on:
+  schedule:
+    # Every 8 hours. GitHub cron is in UTC.
+    # 05:00, 13:00, 21:00 UTC = 6 AM, 2 PM, 10 PM Pacific (PDT).
+    - cron: "0 5,13,21 * * *"
+  workflow_dispatch: {}   # lets you run it manually from the Actions tab
+
+# Allow the workflow to commit the updated seen_jobs.json back to the repo.
+permissions:
+  contents: write
+
+# Prevent overlapping runs from clobbering each other's history commit.
+concurrency:
+  group: kaiser-job-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run job check
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Optional overrides — uncomment to customize:
+          # KEYWORDS: "registered nurse,RN"
+          # MAX_PAGES: "5"
+        run: python check_kaiser_jobs.py
+
+      - name: Save seen-jobs history
+        run: |
+          if [[ -n "$(git status --porcelain seen_jobs.json)" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add seen_jobs.json
+            git commit -m "Update seen_jobs.json [skip ci]"
+            git push
+          else
+            echo "No history changes to commit."
+          fi
