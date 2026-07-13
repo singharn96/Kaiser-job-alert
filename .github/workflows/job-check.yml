@@ -2,9 +2,9 @@ name: Kaiser NorCal RN Job Check
 
 on:
   schedule:
-        # Every 30 minutes, around the clock.
+    # Every 2 hours, around the clock.
         # (GitHub may delay scheduled runs a few minutes under load.)
-        - cron: "*/30 * * * *"
+    - cron: "0 */2 * * *"
   workflow_dispatch: {}   # lets you run it manually from the Actions tab
 
 # Allow the workflow to commit the updated seen_jobs.json back to the repo.
